@@ -9,17 +9,23 @@ import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.BooleanLiteralExpr;
 import com.github.javaparser.ast.expr.CharLiteralExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.DoubleLiteralExpr;
 import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.IntegerLiteralExpr;
 import com.github.javaparser.ast.expr.LongLiteralExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.SwitchExpr;
 import com.github.javaparser.ast.expr.UnaryExpr;
+import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.ast.stmt.DoStmt;
 import com.github.javaparser.ast.stmt.ForEachStmt;
 import com.github.javaparser.ast.stmt.ForStmt;
@@ -27,6 +33,11 @@ import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.stmt.SwitchStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
+import com.github.javaparser.resolution.declarations.ResolvedValueDeclaration;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -41,9 +52,11 @@ import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
@@ -142,8 +155,19 @@ public final class CodeRuleValidator {
                 .mapToInt(m -> Integer.parseInt(m.group(1)))
                 .max();
 
-        JavaParser parser = new JavaParser(
-                new ParserConfiguration().setLanguageLevel(LanguageLevel.JAVA_21));
+        ParserConfiguration config = new ParserConfiguration().setLanguageLevel(LanguageLevel.JAVA_21);
+        // クロスクラスの参照解決（値フロー検査で使用）。ソースルートが取得できない場合は
+        // シンボル解決なしで動作する（resolve() が失敗し、値フロー検査が無効化されるだけ）。
+        Path sourceRoot = sourceRootOf(appDir);
+        if (sourceRoot != null && Files.isDirectory(sourceRoot)) {
+            // 型ソルバが他ファイルを再パースする際も Java 21 構文を扱えるようにする
+            ParserConfiguration solverConfig =
+                    new ParserConfiguration().setLanguageLevel(LanguageLevel.JAVA_21);
+            CombinedTypeSolver typeSolver = new CombinedTypeSolver(new ReflectionTypeSolver());
+            typeSolver.add(new JavaParserTypeSolver(sourceRoot, solverConfig));
+            config.setSymbolResolver(new JavaSymbolSolver(typeSolver));
+        }
+        JavaParser parser = new JavaParser(config);
 
         List<Source> sources = new ArrayList<>();
 
@@ -214,6 +238,21 @@ public final class CodeRuleValidator {
                         violations.add(loc(file, var)
                                 + " 外部化すべき値（シークレット・ユーザ名・DB接続情報・URL 等）のハードコードは禁止です（"
                                 + var.getNameAsString() + "）。application.yaml + 環境変数経由で注入してください");
+                    }
+                }
+            }
+
+            // 外部化対象の混入防止（値ベース・キーワード）: constants/ では文字列リテラルが許可される
+            // ため、その「値」自体が外部化キーワード（secret-keywords.txt）を含む場合も禁止する。
+            // 検査対象は constants/ のみ（値の形式マッチ looksLikeSecretValue とは別に、設定キー名等の
+            // キーワード混入を拾う）。
+            if (dir.equals("constants")) {
+                for (StringLiteralExpr literal : cu.findAll(StringLiteralExpr.class)) {
+                    String value = literal.getValue();
+                    if (matchesSecretKeyword(value)) {
+                        violations.add(loc(file, literal)
+                                + " 外部化すべき値（シークレット・ユーザ名・DB接続情報・URL 等）のハードコードは禁止です（値: \""
+                                + preview(value) + "\"）。application.yaml + 環境変数経由で注入してください");
                     }
                 }
             }
@@ -299,6 +338,9 @@ public final class CodeRuleValidator {
 
         // ルール10: internal は repository／外部連携へ推移的に到達してはならない
         violations.addAll(validateInternalReach(sources));
+
+        // ルール16: 外部連携呼び出しに渡る値が constants/ 由来（直書き）でないこと（値フロー検査）
+        violations.addAll(validateTaintToExternal(sources));
 
         return violations;
     }
@@ -508,6 +550,209 @@ public final class CodeRuleValidator {
             }
         }
         return violations;
+    }
+
+    /**
+     * ルール16（値フロー検査）: {@code repository/} の外部クライアント呼び出し／生成に渡る引数が、
+     * {@code constants/} 由来の値（直書きの定数。別名ローカル変数・フィールド経由を含む）であれば
+     * エラーとする。接続情報・シークレットは {@code constants/} ではなく {@code application.yaml} +
+     * 環境変数（{@code @Value} / {@code System.getenv}）経由で注入させるため。
+     *
+     * <p>クロスクラス解決には JavaParser の {@link JavaSymbolSolver} を用いる。シンボル解決が
+     * 構成できない場合（ソースルート未取得・外部jar未解決など）は、その引数の判定をスキップする
+     * （誤検知を出さない方針）。
+     *
+     * <p><b>v1 の追跡範囲</b>: 「constants の定数 → repository での使用（直接／同一クラス内の別名）」を
+     * 追跡する。レイヤーをまたいでメソッド引数として渡ってきた値（呼び出し元での実引数）までは辿らない。
+     * また、変数に束ねず連鎖呼び出ししている外部クライアント（{@code X.builder().build().call(..)}）は
+     * レシーバ型を解決できないため検出対象外。
+     */
+    private List<String> validateTaintToExternal(List<Source> sources) {
+        // constants/ クラスの FQN 集合（汚染源の判定に使用）
+        Set<String> constantFqns = new HashSet<>();
+        for (Source s : sources) {
+            if (s.dir().equals("constants")) {
+                constantFqns.add(fqnOf(s.file(), "constants"));
+            }
+        }
+        if (constantFqns.isEmpty()) {
+            return List.of();
+        }
+
+        // 重複報告（FieldAccessExpr とその内側 NameExpr 等）を避けるため Set で集約
+        Set<String> violations = new LinkedHashSet<>();
+        for (Source s : sources) {
+            if (!s.dir().equals("repository")) {
+                continue;
+            }
+            Set<String> externalTypes = externalSimpleTypeNames(s.cu());
+            if (externalTypes.isEmpty()) {
+                continue;
+            }
+            Map<String, String> declaredTypes = declaredTypeSimpleNames(s.cu());
+
+            // 外部クライアントのメソッド呼び出し（receiver.method(args)）
+            for (MethodCallExpr call : s.cu().findAll(MethodCallExpr.class)) {
+                if (!isExternalSink(call, externalTypes, declaredTypes)) {
+                    continue;
+                }
+                for (Expression arg : call.getArguments()) {
+                    checkArgForConstants(arg, s.file(), constantFqns, violations);
+                }
+            }
+            // 外部クライアントの生成（new ExternalType(args)）
+            for (ObjectCreationExpr created : s.cu().findAll(ObjectCreationExpr.class)) {
+                if (!externalTypes.contains(created.getType().getNameAsString())) {
+                    continue;
+                }
+                for (Expression arg : created.getArguments()) {
+                    checkArgForConstants(arg, s.file(), constantFqns, violations);
+                }
+            }
+        }
+        return new ArrayList<>(violations);
+    }
+
+    /** CU の import のうち外部連携パッケージに該当するものの単純クラス名集合（ワイルドカードは対象外）。 */
+    private Set<String> externalSimpleTypeNames(CompilationUnit cu) {
+        Set<String> names = new HashSet<>();
+        for (ImportDeclaration imp : cu.getImports()) {
+            if (imp.isAsterisk()) {
+                continue;
+            }
+            String name = imp.getNameAsString();
+            if (isExternalImport(name)) {
+                names.add(simpleName(name));
+            }
+        }
+        return names;
+    }
+
+    /** クラス内の変数・パラメータ・フィールド名 → 宣言型の単純名（{@code var} は対象外）のマップ。 */
+    private Map<String, String> declaredTypeSimpleNames(CompilationUnit cu) {
+        Map<String, String> types = new HashMap<>();
+        for (VariableDeclarator v : cu.findAll(VariableDeclarator.class)) {
+            types.put(v.getNameAsString(), simpleTypeName(v.getType()));
+        }
+        for (Parameter p : cu.findAll(Parameter.class)) {
+            types.put(p.getNameAsString(), simpleTypeName(p.getType()));
+        }
+        return types;
+    }
+
+    private String simpleTypeName(Type type) {
+        return type.isClassOrInterfaceType()
+                ? type.asClassOrInterfaceType().getNameAsString()
+                : type.asString();
+    }
+
+    /** メソッド呼び出しのレシーバが外部クライアント（外部型の変数／フィールド、または外部型の静的呼び出し）か。 */
+    private boolean isExternalSink(MethodCallExpr call, Set<String> externalTypes,
+                                   Map<String, String> declaredTypes) {
+        Optional<Expression> scope = call.getScope();
+        if (scope.isEmpty()) {
+            return false;
+        }
+        Expression sc = scope.get();
+        String receiver = null;
+        if (sc.isNameExpr()) {
+            receiver = sc.asNameExpr().getNameAsString();
+            // 静的呼び出し（ExternalType.method(..)）
+            if (externalTypes.contains(receiver)) {
+                return true;
+            }
+        } else if (sc.isFieldAccessExpr()) {
+            // this.client など
+            receiver = sc.asFieldAccessExpr().getNameAsString();
+        }
+        if (receiver == null) {
+            return false;
+        }
+        String declaredType = declaredTypes.get(receiver);
+        return declaredType != null && externalTypes.contains(declaredType);
+    }
+
+    /** 引数式に含まれる名前参照を辿り、constants/ 由来の値があれば違反として記録する。 */
+    private void checkArgForConstants(Expression arg, Path file, Set<String> constantFqns,
+                                      Set<String> violations) {
+        for (FieldAccessExpr fa : arg.findAll(FieldAccessExpr.class)) {
+            traceConstant(fa, file, constantFqns, violations, new HashSet<>(), 0);
+        }
+        for (NameExpr ne : arg.findAll(NameExpr.class)) {
+            traceConstant(ne, file, constantFqns, violations, new HashSet<>(), 0);
+        }
+    }
+
+    /**
+     * 名前参照（{@code NameExpr}/{@code FieldAccessExpr}）の宣言を解決し、constants/ のフィールドへ
+     * 到達すれば違反を記録する。ローカル変数・自クラスフィールドの場合は初期化子を辿って別名経由も追う。
+     */
+    private void traceConstant(Expression leaf, Path file, Set<String> constantFqns,
+                               Set<String> violations, Set<Integer> visited, int depth) {
+        if (depth > 6) {
+            return;
+        }
+        ResolvedValueDeclaration resolved;
+        try {
+            resolved = resolveValue(leaf);
+        } catch (RuntimeException e) {
+            // 解決不能（外部型・型未解決など）は判定不可としてスキップ（誤検知を避ける）
+            return;
+        }
+        if (resolved == null) {
+            return;
+        }
+        if (resolved.isField()) {
+            String declaringType = resolved.asField().declaringType().getQualifiedName();
+            if (constantFqns.contains(declaringType)) {
+                violations.add(loc(file, leaf)
+                        + " 外部連携呼び出しに渡る値が constants/ 由来です（"
+                        + simpleName(declaringType) + "." + resolved.getName()
+                        + "）。接続情報・シークレットは constants/ ではなく application.yaml + 環境変数"
+                        + "（@Value / System.getenv）経由で注入してください");
+                return;
+            }
+        }
+        // 別名（ローカル変数／自クラスフィールド）の初期化子を辿る
+        Optional<Node> ast = resolved.toAst();
+        if (ast.isEmpty() || !visited.add(System.identityHashCode(ast.get()))) {
+            return;
+        }
+        for (VariableDeclarator vd : ast.get().findAll(VariableDeclarator.class)) {
+            if (!vd.getNameAsString().equals(resolved.getName())) {
+                continue;
+            }
+            vd.getInitializer().ifPresent(init -> {
+                for (FieldAccessExpr fa : init.findAll(FieldAccessExpr.class)) {
+                    traceConstant(fa, file, constantFqns, violations, visited, depth + 1);
+                }
+                for (NameExpr ne : init.findAll(NameExpr.class)) {
+                    traceConstant(ne, file, constantFqns, violations, visited, depth + 1);
+                }
+            });
+        }
+    }
+
+    private ResolvedValueDeclaration resolveValue(Expression leaf) {
+        if (leaf.isFieldAccessExpr()) {
+            return leaf.asFieldAccessExpr().resolve();
+        }
+        return leaf.asNameExpr().resolve();
+    }
+
+    /**
+     * {@code appDir}（{@code .../src/main/java/com/<name>/app}）からソースルート
+     * {@code src/main/java} を求める。階層が満たない場合は {@code null}。
+     */
+    private Path sourceRootOf(Path appDir) {
+        Path p = appDir.getParent();      // com/<name>
+        if (p != null) {
+            p = p.getParent();            // com
+        }
+        if (p != null) {
+            p = p.getParent();            // src/main/java
+        }
+        return p;
     }
 
     /** import に外部連携パッケージ（拒否リスト）が1つでも含まれるか。 */

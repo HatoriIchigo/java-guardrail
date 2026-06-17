@@ -57,6 +57,8 @@ AIがコードを生成・変更していく開発スタイルでは、コード
 
 - **言語 / ビルド**: Java 21 / Maven (`pom.xml`)
 - **AST解析**: JavaParser (`com.github.javaparser:javaparser-core`)
+- **シンボル解決**: JavaParser Symbol Solver (`com.github.javaparser:javaparser-symbol-solver-core`) —
+  クロスクラスの参照解決（値フロー検査で `constants/` 由来の値が外部連携へ流入していないか追跡）
 - **IF仕様書(OpenAPI/YAML)解析**: SnakeYAML (`org.yaml:snakeyaml`)
 - **エントリポイント**: `com.example.Main` (`src/main/java/com/example/Main.java`)
 - **実行**: `maven-shade-plugin` で依存同梱の実行可能JAR (`app.jar`) を生成し、

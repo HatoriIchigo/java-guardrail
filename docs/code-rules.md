@@ -19,9 +19,12 @@
        部分一致）に該当し、かつ文字列リテラルで初期化されている場合エラー。
        **検査対象は `constants/`・`validation/` のみ**（文字列リテラルが許可される場所。他のレイヤーは
        文字列リテラル自体がルール1で禁止のため重複検査しない）。
-     - **値ベース**: 値が既知の外部化対象形式（PEM秘密鍵ヘッダ、AWSアクセスキー `AKIA…`/`ASIA…`、
+     - **値ベース（形式）**: 値が既知の外部化対象形式（PEM秘密鍵ヘッダ、AWSアクセスキー `AKIA…`/`ASIA…`、
        GitHub PAT `ghp_…`、Slackトークン `xox?-…`、JDBC `jdbc:…`、URL `scheme://…`）に一致する場合エラー
        （こちらは全レイヤー対象）。
+     - **値ベース（キーワード）**: 文字列リテラルの**値そのもの**が `secret-keywords.txt` のキーワードを
+       含む場合エラー（設定キー名 `db.password` 等の混入を検出。大文字小文字無視の部分一致）。
+       **検査対象は `constants/` のみ**。
      - 読み込み優先順位: `-Dsecret.keywords=<path>` → カレントの `secret-keywords.txt` →
        JAR同梱 `src/main/resources/secret-keywords.txt`（再ビルドなしで差し替え可能）。
 

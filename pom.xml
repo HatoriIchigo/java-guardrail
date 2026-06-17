@@ -25,6 +25,13 @@
             <version>${javaparser.version}</version>
         </dependency>
 
+        <!-- シンボル解決（クロスクラスの参照解決：値フロー検査で使用） -->
+        <dependency>
+            <groupId>com.github.javaparser</groupId>
+            <artifactId>javaparser-symbol-solver-core</artifactId>
+            <version>${javaparser.version}</version>
+        </dependency>
+
         <!-- IF仕様書(OpenAPI/YAML)の解析 -->
         <dependency>
             <groupId>org.yaml</groupId>
