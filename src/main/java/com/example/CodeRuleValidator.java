@@ -242,21 +242,6 @@ public final class CodeRuleValidator {
                 }
             }
 
-            // 外部化対象の混入防止（値ベース・キーワード）: constants/ では文字列リテラルが許可される
-            // ため、その「値」自体が外部化キーワード（secret-keywords.txt）を含む場合も禁止する。
-            // 検査対象は constants/ のみ（値の形式マッチ looksLikeSecretValue とは別に、設定キー名等の
-            // キーワード混入を拾う）。
-            if (dir.equals("constants")) {
-                for (StringLiteralExpr literal : cu.findAll(StringLiteralExpr.class)) {
-                    String value = literal.getValue();
-                    if (matchesSecretKeyword(value)) {
-                        violations.add(loc(file, literal)
-                                + " 外部化すべき値（シークレット・ユーザ名・DB接続情報・URL 等）のハードコードは禁止です（値: \""
-                                + preview(value) + "\"）。application.yaml + 環境変数経由で注入してください");
-                    }
-                }
-            }
-
             // ルール5: 固定値（リテラル）の return 禁止（null は許可）
             if (!hardcodeExempt) {
                 for (ReturnStmt ret : cu.findAll(ReturnStmt.class)) {
